@@ -1,0 +1,856 @@
+import math
+import torch.nn.functional as F
+import timeit
+from typing import Iterable
+import torch
+from torch import nn
+from einops import rearrange, einsum, reduce
+
+from edtrace import text, image, link
+from lecture_util import article_link
+from gpu_util import cuda_if_available, get_max_memory_usage
+from facts import h100_flop_per_sec, h100_bytes_per_sec
+from references import deepseek_v3_2_2025, adagrad_2011, nemotron_3_super_2026
+
+
+def main():
+    text("???")
+    text("- ?? CS336 Slack")
+    text("- ???? **Stanford** ??? Modal ??")
+    text("- ?? [AI ????](https://docs.google.com/document/d/1SZAlExB1qAc9izHt54gwunNpjKE6wXb8Y7yA_e-baK8/edit?tab=t.0)")
+    text("- ?? [????](https://docs.google.com/document/d/1cHE0iKVyXLJ3XpIs2XuXTmZ-HMmPk2hIPeCvy-AydMg/edit?tab=t.otis27tacaef)")
+
+    text("Marin ? 1e23 FLOPs ????????[????](https://x.com/WilliamBarrHeld/status/2039373983632814318)!")
+    image("https://pbs.twimg.com/media/HE1P1HmaUAAjLXF?format=jpg&name=medium", width=800)
+
+    text("???? ?????")
+    text("??? ????????")
+
+    text("??? ??????????????????????????")
+    text("????????????**??**?")
+    text("???????????????????????")
+
+    motivating_questions()
+
+    text("??????????")
+    text("- ????????PyTorch ???")
+    text("- ???????????????????")
+    text("- ??????????????????????")
+
+    # ????
+    tensors_basics()
+    tensors_memory()
+    tensors_on_gpus()
+
+    # ????
+    tensor_einops()
+    tensor_operations_flops()
+
+    arithmetic_intensity()
+
+    # ?? ?? ?? accounting ?? ??
+    deep_network()
+    gradients_basics()
+    gradients_flops()
+    optimizer()
+    train_loop()
+
+    # ??????
+    gradient_accumulation()
+    activation_checkpointing()
+
+    text("???")
+    text("- ??????????????????????????????")
+    text("- einops: ???????????")
+    text("- 6 (# ?? points) (# ??) FLOPs ? ?? ??")
+    text("- ???? / roofline ??????????????")
+    text("- ????????????????????")
+    text("- ???????????????????????")
+
+
+def motivating_questions():
+    text("**??**: ? 1024 ? H100 ??? 15T ? token ???? 70B ?????????")
+    total_flops = 6 * 70e9 * 15e12  # @inspect total_flops
+    h100_flop_per_sec = 1979e12 / 2
+    mfu = 0.5
+    flops_per_day = h100_flop_per_sec * mfu * 1024 * 60 * 60 * 24  # @inspect flops_per_day
+    days = total_flops / flops_per_day  # @inspect days
+
+    text("**??**: ?? AdamW ? 8 ? H100 ?????????????")
+    h100_bytes = 80e9  # @inspect h100_bytes
+    bytes_per_parameter = 2 + 2 + (4 + 4)  # parameters (2), gradients (2), optimizer state (4 + 4) @inspect bytes_per_parameter
+    num_parameters = (h100_bytes * 8) / bytes_per_parameter  # @inspect num_parameters
+    text("????????????????????????????????")
+
+    text("??????????")
+    text("??????????????????????????")
+
+
+def tensors_basics():
+    text("???????????????")
+    text("- ??")
+    text("- ??")
+    text("- ??")
+    text("- ??? state")
+    text("- ???")
+
+    text("???DeepSeek v3.2 ????? "), link(deepseek_v3_2_2025)
+    link(title="DeepSeek v3.2 model on Hugging Face", url="https://huggingface.co/deepseek-ai/DeepSeek-V3.2?show_file_info=model.safetensors.index.json")
+
+    text("??????????????")
+    x = torch.zeros(4)        # rank 1 tensor (vector) @inspect x
+    x = torch.zeros(4, 8)     # rank 2 tensor (matrix) @inspect x
+    x = torch.zeros(4, 8, 2)  # rank 3 tensor @inspect x
+
+    text("? Transformer ????????? 4 ????")
+    B = 32   # Batch size
+    S = 16   # Sequence length
+    H = 16   # Number of heads
+    D = 64   # Hidden dimension per head
+    x = torch.zeros(B, S, H, D)
+
+
+def tensors_memory():
+    text("????????????")
+
+    text("## fp32")
+    link(title="Wikipedia", url="https://en.wikipedia.org/wiki/Single-precision_floating-point_format")
+    image("images/fp32.png", width=700)
+    text("fp32 ???????? float32 ???????????")
+    text("?????????? fp32 ??????????????????fp64??")
+    text("?????????????????")
+
+    text("?????????????")
+    text("????????????(i) ?????(ii) ??????????")
+    x = torch.zeros(4, 8)  # @inspect x
+    assert x.dtype == torch.float32  # Default type
+    assert x.numel() == 4 * 8
+    assert x.element_size() == 4  # Float is 4 bytes
+    assert get_memory_usage(x) == 4 * 8 * 4  # 128 bytes
+
+    text("GPT-3 ??????????")
+    assert get_memory_usage(torch.empty(12288 * 4, 12288)) == 2304 * 1024 * 1024  # 2.3 GB @stepover
+
+    text("## fp16")
+    link(title="Wikipedia", url="https://en.wikipedia.org/wiki/Half-precision_floating-point_format")
+    image("images/fp16.png", width=400)
+    text("fp16 ???????? float16 ??????????????")
+    x = torch.zeros(4, 8, dtype=torch.float16)  # @inspect x
+    assert x.element_size() == 2
+    text("?????????????????????")
+    x = torch.tensor([1e-8], dtype=torch.float16)  # @inspect x
+    assert x == 0  # Underflow!
+    text("?????????????????????")
+
+    text("## bf16")
+    link(title="Wikipedia", url="https://en.wikipedia.org/wiki/Bfloat16_floating-point_format")
+    image("images/bf16.png", width=400)
+    text("Google Brain ? 2018 ?????????bf16?????????")
+    text("bf16 ? fp16 ??????????? fp32 ????????")
+    text("????????????????????????")
+    x = torch.tensor([1e-8], dtype=torch.bfloat16)  # @inspect x
+    assert x != 0  # No underflow!
+
+    text("## ????")
+    text("???????")
+    text("- ?? fp32 ?????????????")
+    text("- ?? fp16??? bf16 ???????????????")
+
+    text("??????????? "), link("https://arxiv.org/pdf/1710.03740.pdf")
+    text("- ??????????? bf16")
+    text("- ??????? fp32")
+
+    text("Pytorch ? an automatic mixed precision (AMP) library. "), link(title="docs", url="https://pytorch.org/docs/stable/amp.html")
+    text("???????????? bf16????????exp ????")
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        x = torch.zeros(4, 8)  # @inspect x
+
+    text("## fp8")
+    text("2022 ??????????????fp8 ?????? [primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html).")
+    image("https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/_images/fp8_formats.png", width=600)
+    text("H100 ???? FP8 ??? E4M3 (range [-448, 448]) ?? E5M2 ([-57344, 57344]).")
+    text("??? "), link("https://arxiv.org/pdf/2209.05433.pdf")
+
+    text("## fp4")
+    text("2025 ??NVIDIA ??? [nvfp4](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)")
+    text("????? 4 ??")
+    text("?: -6, -4, -3, -2, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2, 3, 4, 6")
+    text("???????????????????????????????????????????")
+    text("Nemotron 3 Super ? ?? ? NVFP4 "), link(nemotron_3_super_2026)
+
+    text("????????????? NVIDIA ????")
+
+
+def tensors_on_gpus():
+    text("??????????? CPU ????")
+    x = torch.zeros(32, 32)
+    assert x.device == torch.device("cpu")
+
+    text("?? GPU ??")
+    image("images/cpu-gpu.png", width=600)
+    device = cuda_if_available()  # @inspect device
+
+    text("???? GPU ?????????????????? GPU ????")
+    x = x.to(device)
+
+    text("????? GPU ??????")
+    with torch.device(device):
+        x = torch.zeros(32, 32)
+        assert x.device == device
+
+
+def tensor_einops():
+    einops_motivation()
+
+    text("Einops ??????????????????????")
+    text("????????????Einstein?1916?????")
+    link(title="Einops tutorial", url="https://einops.rocks/1-einops-basics/")
+
+    einops_einsum()
+    einops_reduce()
+    einops_rearrange()
+
+
+def einops_motivation():
+    text("?? PyTorch ???")
+    x = torch.ones(2, 2, 3)      # batch seq hidden  @inspect x
+    y = torch.ones(2, 2, 3)      # batch seq hidden  @inspect y
+    z = x @ y.transpose(-2, -1)  # batch seq seq  @inspect z
+    text("????????-2?-1 ?????????")
+
+
+def einops_einsum():
+    text("Einsum ?????????????????")
+
+    x = torch.ones(3, 4)  # seq1 hidden @inspect x
+    y = torch.ones(4, 3)  # hidden seq2 @inspect y
+
+    # Old way
+    z = x @ y   # seq1 seq2 @inspect z
+
+    # New (einops) way
+    z = einsum(x, y, "seq1 hidden, hidden seq2 -> seq1 seq2")  # @inspect z
+
+    text("?????????????")  # @clear x y z
+
+    x = torch.ones(2, 3, 4)  # batch seq1 hidden @inspect x
+    y = torch.ones(2, 3, 4)  # batch seq2 hidden @inspect y
+
+    # Old way
+    z = x @ y.transpose(-2, -1)  # batch seq1 seq2  @inspect z
+
+    # New (einops) way
+    z = einsum(x, y, "batch seq1 hidden, batch seq2 hidden -> batch seq1 seq2")  # @inspect z
+    text("??????????????")
+
+    # ? ?? ?? `...` ? represent broadcasting over any ?? ? ??
+    z = einsum(x, y, "... seq1 hidden, ... seq2 hidden -> ... seq1 seq2")  # @inspect z
+
+
+def einops_reduce():
+    text("???????????? sum????max?min???????????")
+    x = torch.ones(2, 3, 4)  # batch seq hidden @inspect x
+
+    # Old way
+    y = x.sum(dim=-1)  # @inspect y
+
+    # New (einops) way
+    y = reduce(x, "... hidden -> ...", "sum")  # @inspect y
+
+
+def einops_rearrange():
+    text("?????????????")
+    text("?????????????????")
+
+    x = torch.ones(3, 8)  # seq total_hidden @inspect x
+    text("???? `total_hidden` ? `heads * hidden1` ?????")
+    w = torch.ones(4, 4)  # hidden1 hidden2 @inspect w
+
+    # Break ? `??_hidden` ?? two ?? (`heads` ?? `hidden1`
+    x = rearrange(x, "... (heads hidden1) -> ... heads hidden1", heads=2)  # @inspect x
+
+    # ?? the transformation ?? `w`
+    x = einsum(x, w, "... hidden1, hidden1 hidden2 -> ... hidden2")  # @inspect x
+
+    # ?? `heads` ?? `hidden2` back ??
+    x = rearrange(x, "... heads hidden2 -> ... (heads hidden2)")  # @inspect x
+
+
+def tensor_operations_flops():
+    text("??????????????????????")
+
+    text("?????FLOP?????x + y?????x y???????")
+
+    text("??????????????????")
+    text("- FLOPs: ??????????????")
+    text("- FLOP/s: ???????????? FLOPS???????????")
+
+    text("## Intuitions")
+    text("?? GPT-3?2020??? 3.14e23 FLOPs? "), article_link("https://lambdalabs.com/blog/demystifying-gpt-3")
+    text("?????? GPT-4?2023??? 2e25 FLOPs? "), article_link("https://patmcguinness.substack.com/p/gpt-4-details-revealed")
+
+    text("H100 ????????????? 1979 teraFLOP/s?????????? 50%?"), link(title="spec", url="https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet")
+    h100_flop_per_sec = 1979e12 / 2
+
+    text("8 ? H100 ?? 2 ??")
+    total_flops = 8 * 2 * (60 * 60 * 24 * 7) * h100_flop_per_sec  # @inspect total_flops
+
+    text("## Linear ??")
+    if torch.cuda.is_available():
+        B = 16384  # Number of points
+        D = 32768  # Dimension of each point
+        K = 8192   # Number of outputs
+    else:
+        B = 1024
+        D = 256
+        K = 64
+
+    x = torch.ones(B, D, device=cuda_if_available())
+    w = torch.randn(D, K, device=cuda_if_available())
+    y = x @ w
+
+    text("?????????? FLOPs?")
+    text("?? (i, j, k) ??????????x[i][j] * w[j][k]???????")
+    actual_num_flops = 2 * B * D * K  # @inspect actual_num_flops
+
+    text("?????????????????????")
+    actual_time = benchmark(lambda: x @ w)  # @inspect actual_time
+
+    text("??????? FLOP/s?")
+    actual_flop_per_sec = actual_num_flops / actual_time  # @inspect actual_flop_per_sec
+
+    text("?? GPU ?????????????")
+    text("- ??: "), link(title="H100 spec", url="https://resources.nvidia.com/en-us-gpu-resources/h100-datasheet-24306")
+    text("???FLOP/s ??????????")
+    promised_flop_per_sec = get_promised_flop_per_sec(x.dtype)  # @inspect promised_flop_per_sec
+
+    text("## ?? FLOPs utilization (MFU)")
+
+    text("???MFU = (actual FLOP/s) / (promised FLOP/s) [ignore ??/overhead]")
+    mfu = actual_flop_per_sec / promised_flop_per_sec if promised_flop_per_sec else None  # @inspect mfu
+
+    text("??, MFU ? ≥ 0.5 ? ?? ?!")
+
+    text("???? MFU ????? 1?")
+    text("???????????????? GPU ????????")
+
+
+def arithmetic_intensity():
+    image("images/compute-memory.png", width=300)
+    text("?????????")
+    text("1. ????????????")
+    text("2. ????")
+    text("3. ????????????")
+
+    text("??????")
+
+    text("??????")
+    text("1. ??????FLOP/s?")
+    text("2. ???????/s?")
+    assert h100_flop_per_sec == 1979e12 / 2  # Half without sparsity
+    assert h100_bytes_per_sec == 3.35e12
+
+    arithmetic_intensity_relu()
+    arithmetic_intensity_gelu()
+    arithmetic_intensity_dot_product()
+    arithmetic_intensity_matrix_vector_product()
+    arithmetic_intensity_matmul()
+
+    # ?'s visualize it
+    roofline_plots()
+
+
+def arithmetic_intensity_relu():
+    n = 1024 * 1024
+    x = torch.ones(n, dtype=torch.bfloat16, device=cuda_if_available())
+    y = torch.relu(x)
+
+    bytes = (2 * n) + (2 * n)  # ?? x, write y (bf16 is 2 bytes/float)
+    flops = n  # n comparisons
+
+    communication_time = bytes / h100_bytes_per_sec  # @inspect communication_time
+    computation_time = flops / h100_flop_per_sec  # @inspect computation_time
+
+    text("??????????????")
+    total_time = max(communication_time, computation_time)  # @inspect total_time
+
+    text("??????")
+    text("- ????? ?? ?? > ?? ??")
+    text("- ????? ?? ?? > ?? ??")
+
+    text("???????ReLU ??????")
+
+    text("????????")
+    text("?????????????????????????")
+    h100_accelerator_intensity = h100_flop_per_sec / h100_bytes_per_sec  # @inspect h100_accelerator_intensity
+
+    text("????????????????????????")
+    arithmetic_intensity = flops / bytes  # ~1/4 @inspect arithmetic_intensity
+
+    text("??????")
+    text("- ????? arithmetic intensity < accelerator intensity")
+    text("- ????? arithmetic intensity > accelerator intensity")
+
+    assert arithmetic_intensity < h100_accelerator_intensity
+
+    text("??????????????????")
+    text("?????????")
+
+
+def arithmetic_intensity_gelu():
+    n = 1024 * 1024
+    x = torch.ones(n, dtype=torch.bfloat16, device=cuda_if_available())
+    y = F.gelu(x)  # GELU(x) = 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+
+    bytes = (2 * n) + (2 * n)  # ?? x, write y (bf16 is 2 bytes/float)
+    flops = 20 * n  # tanh can be approximated in various ways (e.g., polynomials)
+
+    arithmetic_intensity = flops / bytes  # @inspect arithmetic_intensity
+
+    h100_accelerator_intensity = h100_flop_per_sec / h100_bytes_per_sec  # @inspect h100_accelerator_intensity
+    assert arithmetic_intensity < h100_accelerator_intensity
+
+    text("???GeLU ????????????? ReLU ????????????")
+    text("?????????")
+    text("?????ReLU ??? GeLU ????????????")
+
+
+def arithmetic_intensity_dot_product():
+    n = 1024 * 1024
+    x = torch.ones(n, dtype=torch.bfloat16, device=cuda_if_available())
+    w = torch.ones(n, dtype=torch.bfloat16, device=cuda_if_available())
+    y = x @ w
+
+    bytes = (2 * n) + (2 * n) + 2  # ?? x, read w, write y
+    flops = 2 * n - 1  # n multiplications, n-1 additions
+
+    arithmetic_intensity = flops / bytes  # ~1/2 @inspect arithmetic_intensity
+
+    h100_accelerator_intensity = h100_flop_per_sec / h100_bytes_per_sec  # @inspect h100_accelerator_intensity
+    assert arithmetic_intensity < h100_accelerator_intensity
+    text("??????")
+
+
+def arithmetic_intensity_matrix_vector_product():
+    n = 1024
+    x = torch.ones(n, dtype=torch.bfloat16, device=cuda_if_available())
+    w = torch.ones(n, n, dtype=torch.bfloat16, device=cuda_if_available())
+    y = x @ w
+
+    bytes = (2 * n) + (2 * n * n) + (2 * n)  # ?? x, read w, write y
+    flops = n * (2 * n - 1)  # n dot-products
+
+    arithmetic_intensity = flops / bytes  # ~1 @inspect arithmetic_intensity
+
+    h100_accelerator_intensity = h100_flop_per_sec / h100_bytes_per_sec  # @inspect h100_accelerator_intensity
+    assert arithmetic_intensity < h100_accelerator_intensity
+    text("??????")
+
+def arithmetic_intensity_matmul():
+    n = 1024
+    x = torch.ones(n, n, dtype=torch.bfloat16, device=cuda_if_available())
+    w = torch.ones(n, n, dtype=torch.bfloat16, device=cuda_if_available())
+    y = x @ w
+
+    bytes = (2 * n * n) + (2 * n * n) + (2 * n * n)  # ?? x, read w, write y
+    flops = n * n * (2 * n - 1)  # n^2 dot products
+
+    arithmetic_intensity = flops / bytes  # ~n/3 @inspect arithmetic_intensity
+
+    h100_accelerator_intensity = h100_flop_per_sec / h100_bytes_per_sec  # @inspect h100_accelerator_intensity
+    assert arithmetic_intensity > h100_accelerator_intensity
+    text("?????????")
+
+    text("????????????????????????????")
+    text("?? Transformer ?????????")
+    text("??????????-???????????????????")
+
+    text("???????/????????????bf16 ? fp32??")
+
+
+def roofline_plots():
+    text("?????? roofline ?????????????????")
+    image("https://jax-ml.github.io/scaling-book/assets/img/roofline-improved-1400.webp", width=600)
+    text("- x ???????????????????????")
+    text("- ??????????????")
+    text("- ?????????????????????????")
+
+    text("??????? MFU ?????")
+    text("MFU = min(1, arithmetic-intensity / accelerator-intensity)")
+
+    link(title="reference", url="https://jax-ml.github.io/scaling-book/roofline/")
+
+
+def gradients_basics():
+    text("?????????????????????????????")
+    text("????????????????")
+
+    text("????????????????")
+    text("y = 0.5 (x * w - 5)^2")
+
+    text("?????????")
+    x = torch.tensor([1., 2, 3])
+    w = torch.tensor([1., 1, 1], requires_grad=True)  # Want gradient
+    pred_y = x @ w
+    loss = 0.5 * (pred_y - 5).pow(2)
+
+    text("?????????")
+    loss.backward()
+    assert torch.equal(w.grad, torch.tensor([1, 2, 3]))  # @inspect w.grad
+
+
+def gradients_flops():
+    text("???????? FLOPs?")
+
+    image("images/deep-network.png", width=800)
+
+    B = 1024  # Number of points
+    D = 256   # Dimension
+
+    text("?????????????????")
+    x = torch.ones(B, D, device=cuda_if_available())
+    w1 = torch.randn(D, D, device=cuda_if_available(), requires_grad=True)
+    w2 = torch.randn(D, D, device=cuda_if_available(), requires_grad=True)
+
+    # ????
+    h1 = einsum(x, w1, "batch in, in out -> batch out")  # x @ w1
+    h2 = einsum(h1, w2, "batch in, in out -> batch out")  # h1 @ w2
+    loss = (h2.mean() - 0)**2  # Regress everything to 0 (arbitrary)
+
+    # ????
+    h1.retain_grad()  # For debugging
+    h2.retain_grad()  # For debugging
+    loss.backward()
+
+    text("## ??????")
+    text("??????h2 = h1 @ w2?")
+
+    text("**????**????? FLOPs ??? ")
+    num_forward_flops = 2 * B * D * D   # @inspect num_forward_flops
+
+    text("**????**??????????? FLOPs?")
+
+    text("???????")
+    text("- h1.?? = d ?? / d h1")
+    text("- w2.?? = d ?? / d w2")
+
+    h1_grad = einsum(h2.grad, w2, "batch out, in out -> batch in")
+    assert torch.allclose(h1.grad, h1_grad)
+
+    w2_grad = einsum(h2.grad, h1, "batch out, batch in -> in out")
+    assert torch.allclose(w2.grad, w2_grad)
+
+    num_backward_flops = (2 * B * D * D) + (2 * B * D * D)  # @inspect num_backward_flops
+
+    text("????????????????? 2 ??")
+
+    text("## ?????")
+    text("????? w2????????????????")
+
+    text("?????")
+    text("- ????: 2 (# ?? points) (# ??) FLOPs")
+    text("- ????: 4 (# ?? points) (# ??) FLOPs")
+    text("- ??: 6 (# ?? points) (# ??) FLOPs")
+
+    text("??????????MLP??")
+    text("?????????????????????? Transformer ??????")
+
+
+def deep_network():
+    image("images/deep-network.png", width=800)
+    text("????? L ????/???/???? D ???????")
+
+    # Define the network
+    D = 8  # Dimensionality of input, activations, and output
+    L = 3  # Number of layers
+    model = DeepNetwork(dim=D, num_layers=L).to(cuda_if_available())
+
+    num_parameters = get_num_parameters(model)  # @inspect num_parameters @stepover
+    assert num_parameters == (D * D) * L
+
+    # ?? the ?? ? a ?? ? ??
+    B = 4  # Batch size
+    x = torch.randn(B, D, device=cuda_if_available())  # @inspect x
+    y = model(x)  # @inspect y
+
+
+class Block(nn.Module):
+    """Simple block that applies a linear transformation followed by a ReLU nonlinearity."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim, dim) / math.sqrt(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x @ self.weight  # Linear
+        x = F.relu(x)        # Activation
+        return x
+
+
+class DeepNetwork(nn.Module):
+    """Map `dim`-vector to a `dim`-vector."""
+    def __init__(self, dim: int, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([Block(dim) for i in range(num_layers)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ?? ?? the ? sequentially
+        for layer in self.layers:
+            x = layer(x)  # @stepover
+        return x
+
+
+def optimizer():
+    text("??????????")
+    B = 2  # Batch size
+    D = 4  # Dimensionality of input, activations, and output
+    L = 3  # Number of layers
+    model = DeepNetwork(dim=D, num_layers=L).to(cuda_if_available())  # @stepover
+
+    text("??? AdaGrad ????")
+    text("- momentum = SGD + ???????")
+    text("- AdaGrad = SGD + ?? ?? ??^2")
+    text("- RMSProp = AdaGrad??? ??^2 ??????")
+    text("- Adam = RMSProp + momentum")
+
+    text("AdaGrad "), link(adagrad_2011)
+    optimizer = AdaGrad(model.parameters(), lr=0.01)  # @stepover
+    state = model.state_dict()  # @inspect state
+
+    # ?? ??
+    x = torch.randn(B, D, device=cuda_if_available())
+    y = torch.tensor([4., 5.], device=cuda_if_available())
+    pred_y = model(x).mean()  # @stepover
+    loss = F.mse_loss(input=pred_y, target=y)
+    loss.backward()
+
+    # Take a ??
+    optimizer.step()
+    optimizer_state = {i: dict(p_state) for i, (p, p_state) in enumerate(optimizer.state.items())}  # @inspect optimizer_state
+
+    # Free ? the ??
+    optimizer.zero_grad(set_to_none=True)
+
+    text("## ??")
+
+    num_parameters = D * D * L
+    parameter_memory = 2 * num_parameters  # (2 bytes for bf16) @inspect parameter_memory
+    gradient_memory = 2 * num_parameters  # (2 bytes for bf16) @inspect gradient_memory
+    optimizer_state_memory = 4 * num_parameters  # (4 bytes for fp32) @inspect optimizer_state_memory
+    activation_memory = 2 * (B * D * L)  # (2 bytes for bf16) @inspect activation_memory
+    text("???? fp32 ??????????????????????")
+    text("????????")
+    text("- AdaGrad: 4 ??/?? ?? ?? ? ?")
+    text("- Adam: 8 ??/?? ?? ?? ?? ?? ? ?")
+
+    # Putting it ?? ??
+    total_memory = parameter_memory + activation_memory + gradient_memory + optimizer_state_memory  # @inspect total_memory
+
+    text("## ?? (?? ?? ?? ??)")
+    num_parameters = D * D * L
+    flops = 6 * B * num_parameters  # @inspect flops
+
+    text("## Transformers")
+    text("Transformer ?????????????")
+    text("?? 1 ???????????")
+
+    text("?? Transformer ??????????"), article_link("https://erees.dev/transformer-memory/")
+    text("?? Transformer FLOPs ????"), article_link("https://www.adamcasson.com/posts/transformer-flops")
+
+
+class AdaGrad(torch.optim.Optimizer):
+    def __init__(self, params: Iterable[nn.Parameter], lr: float = 0.01):
+        super(AdaGrad, self).__init__(params, dict(lr=lr))
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                # ??? state
+                state = self.state[p]
+                grad = p.grad.data
+
+                # ?? squared ?? g2 = sum_{i<t} g_i^2
+                g2 = state.get("g2", torch.zeros_like(grad))
+
+                # Update ??? state
+                g2 += torch.square(grad)
+                state["g2"] = g2
+
+                # ????
+                p.data -= lr * grad / torch.sqrt(g2 + 1e-5)
+
+
+def train_loop():
+    # ? linear ?? ? weights (0, 1, 2, ..., D-1)
+    D = 16  # Dimensionality
+    true_w = torch.arange(D, dtype=torch.float32, device=cuda_if_available())
+
+    # ?? loader that generates (x, y) pairs
+    B = 4  # Batch size
+    def get_batch() -> tuple[torch.Tensor, torch.Tensor]:
+        x = torch.randn(B, D).to(cuda_if_available())
+        true_y = x @ true_w
+        return (x, true_y)
+
+    # Define the ?? ?? ???
+    L = 2  # Number of layers
+    model = DeepNetwork(dim=D, num_layers=L).to(cuda_if_available()) # @stepover
+    optimizer = AdaGrad(model.parameters(), lr=0.01) # @stepover
+
+    # ??!
+    num_train_steps = 3
+    for t in range(num_train_steps):
+        # ????
+        x, y = get_batch()
+
+        # ?? (?? ??)
+        pred_y = model(x).mean()  # @stepover
+        loss = F.mse_loss(pred_y, y)
+
+        # ?? (?? ??)
+        loss.backward()
+
+        # ????
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+
+def gradient_accumulation():
+    text("???????????")
+    text("????????????????????????")
+    B = 64     # Batch size
+    D = 1024   # Dimensionality
+    L = 16     # Number of layers
+    activation_memory = 2 * B * D * L  # (2 bytes for bf16) @inspect activation_memory
+    text("?????")
+    text("- ?? ?? ? micro ??")
+    text("- Accumulate the ?? (don't zero it ?)")
+    text("- ?? ??_?? / micro_??_?? ??, update the ?? ?? zero ? the ??")
+    micro_batch_size = B / 4
+    activation_memory = 2 * micro_batch_size * D * L  # (2 bytes for bf16) @inspect activation_memory
+
+
+def activation_checkpointing():
+    text("??????????????")
+    text("???????????????????????")
+
+    image("images/deep-network.png", width=800)
+    text("?????")
+    B = 64     # Batch size
+    D = 1024   # Dimensionality
+    L = 16     # Number of layers
+
+    x = torch.randn(B, D, device=cuda_if_available(), requires_grad=True)
+    activation_memory = 2 * B * D * L  # @inspect activation_memory
+
+    model = DeepNetwork(dim=D, num_layers=L).to(cuda_if_available())  # @stepover
+    memory = get_max_memory_usage(lambda: model(x).sum().backward())  # @inspect memory @stepover
+
+    text("?????????")
+
+    text("????? = ????? = ???")
+    text("?????")
+    text("- ????: ?? ? ??? at subset ? ?")
+    text("- ????: recompute the missing ??? ? the last ???")
+    text("?????????")
+
+    # ?? ?? ???:    x g1 h1 g2 h2 g3 h3 g4 h4
+    # ??? ?????: x    h1    h2    h3    h4
+
+    # Define the ?? ? ?????
+    model = DeepNetworkCheckpointed(dim=D, num_layers=L).to(cuda_if_available())  # @stepover
+    checkpointed_memory = get_max_memory_usage(lambda: model(x).sum().backward())  # @inspect checkpointed_memory @stepover
+
+    text("???????????????????L ????")
+
+    # ?? ?? ?:   | h1 h2 h3 h4 h5 h6 h7 h8 h9 |
+    # ?? no ?:    |                            |
+    # ?? ?? ?:  |    h3       h6          h9 |
+
+    text("????????????")
+    text("- ?? ?? ?? ?'s ???, ?? ??? ?? ? O(L) ?? no recomputation.")
+    text("- ?? ?? no ???, ?? ??? ?? ? O(1) ?? ?? ? O(L^2) (recompute ? the start ?? ?? ?).")
+    text("- ?? ?? ?? sqrt(L) ?, ?? ??? ?? ? O(sqrt(L)) ?? O(L) recomputation.")
+
+
+class DeepNetworkCheckpointed(nn.Module):
+    """Same as DeepNetwork, but with activation checkpointing."""
+    def __init__(self, dim: int, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([Block(dim) for i in range(num_layers)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ?? ?? the ? sequentially
+        for layer in self.layers:
+            # KEY: ? ?? ??? at checkpoints, recompute the rest
+            x = torch.utils.checkpoint.checkpoint(layer, x)  # @stepover
+        return x
+
+############################################################
+
+def get_memory_usage(x: torch.Tensor):
+    return x.numel() * x.element_size()
+
+
+def get_promised_flop_per_sec(dtype: torch.dtype) -> float:
+    """Return the peak FLOP/s for `device` operating on `dtype`."""
+    if not torch.cuda.is_available():
+        # No CUDA ?? available, ?? ??'t ?? FLOP/s
+        return 1
+    properties = torch.cuda.get_device_properties(cuda_if_available())  # @inspect properties.name
+
+    if "A100" in properties.name:
+        # https://www.nvidia.com/content/dam/en-zz/Solutions/??-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf
+        if dtype == torch.float32:
+            return 19.5e12
+        if dtype in (torch.bfloat16, torch.float16):
+            return 312e12
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    if "H100" in properties.name:
+        # https://www.nvidia.com/en-us/??-center/h100/
+        if dtype == torch.float32:
+            return 67.5e12
+        if dtype in (torch.bfloat16, torch.float16):
+            return 1979e12 / 2  # 1979 is for sparse, dense is half of that
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    if "B200" in properties.name:
+        # https://www.primeline-solutions.com/media/categories/server/nach-gpu/nvidia-hgx-h200/nvidia-blackwell-b200-datasheet.pdf
+        if dtype == torch.float32:
+            return 75e12
+        if dtype in (torch.bfloat16, torch.float16):
+            return 4.5e15 / 2  # 4.5e15 is for sparse, dense is half of that
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    # Unknown GPU: ?? None ?? caller ?? handle gracefully
+    return None
+
+
+def benchmark(func, num_trials: int = 5) -> float:
+    """Return the number of seconds required to perform `func`."""
+
+    # Wait ?? previous CUDA ?? ? done
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    def run():
+        # ????
+        func()
+
+        # ?? CUDA ????
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    # ????? `num_trials` times
+    total_time = timeit.timeit(run, number=num_trials)
+
+    return total_time / num_trials
+
+
+def get_num_parameters(model: nn.Module) -> int:
+    return sum(param.numel() for param in model.parameters())
+
+
+if __name__ == "__main__":
+    main()
